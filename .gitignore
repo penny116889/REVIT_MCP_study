@@ -153,3 +153,7 @@ docs/fork-audit/
 # docs/_playbook-sync/ 是本機產生的手冊修訂提案，其稽核報告自行判定 deident_pass: false，
 # 代表去識別化未過關，在通過去識別化稽核前不得進版控。
 docs/_playbook-sync/
+
+# 本機參考打包資料夾（非 repo 內容，含大檔案影片與樣板，不入庫）
+01 門窗表-成功版打包*/
+

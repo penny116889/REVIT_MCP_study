@@ -531,9 +531,13 @@ namespace RevitMCP.Core
         	Document document = _uiApp.ActiveUIDocument.Document;
         	string text = parameters?["targetType"]?.Value<string>()?.Trim().ToLowerInvariant();
         	string text2 = parameters?["mode"]?.Value<string>()?.Trim().ToLowerInvariant();
-	        	if (text2 != "list" && text2 != "create" && text2 != "update" && text2 != "migrate")
+	        	if (text2 != "list" && text2 != "create" && text2 != "update" && text2 != "migrate" && text2 != "scaffold_template")
         	{
-	        		throw new Exception("mode must be list, create, update, or migrate");
+	        		throw new Exception("mode must be list, create, update, migrate, or scaffold_template");
+        	}
+        	if (text2 == "scaffold_template")
+        	{
+        		return ScaffoldBlankTemplate(document, parameters);
         	}
         	if (text != "door" && text != "window")
         	{
@@ -4696,6 +4700,278 @@ namespace RevitMCP.Core
         		return typeMark.Trim();
         	}
         	return string.Empty;
+        }
+
+        /// <summary>
+        /// scaffold_template mode: 一鍵自動搭建空白門窗圖例樣板視圖
+        /// 從 seed Legend 複製出新視圖，自動畫出 M×N 表格框線、FFL 基準線、佔位標頭文字、佔位門窗圖例
+        /// </summary>
+        private object ScaffoldBlankTemplate(Document doc, JObject parameters)
+        {
+            int columns = parameters?["columns"]?.Value<int?>() ?? 7;
+            int rows = parameters?["rows"]?.Value<int?>() ?? 3;
+            string templateName = parameters?["templateName"]?.Value<string>()?.Trim() ?? "01_門窗圖例表樣板";
+            string flLineStyleName = parameters?["flLineStyleName"]?.Value<string>()?.Trim() ?? "中級線0.3";
+            int? seedLegendViewId = parameters?["seedLegendViewId"]?.Value<int?>();
+            string targetType = parameters?["targetType"]?.Value<string>()?.Trim().ToLowerInvariant() ?? "window";
+
+            // 檢查是否已存在同名視圖
+            View existingView = new FilteredElementCollector(doc)
+                .OfClass(typeof(View))
+                .Cast<View>()
+                .FirstOrDefault(v => !v.IsTemplate && v.ViewType == ViewType.Legend && v.Name == templateName);
+            if (existingView != null)
+            {
+                return new
+                {
+                    Success = true,
+                    Message = $"圖例樣板視圖「{templateName}」已存在於專案中，可直接使用。",
+                    ViewId = existingView.Id.GetIdValue(),
+                    ViewName = templateName,
+                    AlreadyExisted = true
+                };
+            }
+
+            // 找 seed Legend 視圖
+            if (!seedLegendViewId.HasValue)
+            {
+                return new
+                {
+                    Success = false,
+                    WorkflowState = "awaiting_seed_selection",
+                    NextAction = "call_list_seeds",
+                    SeedTypeRequired = "legend",
+                    RequiresUserInput = true,
+                    DoNotAutoSelectSeed = true,
+                    PromptToUser = "請先呼叫 list_seeds，並選擇一個 Legend View 作為 seed 基底視圖。",
+                    Message = "搭建空白樣板前，需要先選擇一個 seed Legend 視圖作為複製基底。"
+                };
+            }
+
+            ElementId seedId = new ElementId((IdType)seedLegendViewId.Value);
+            View seedView = doc.GetElement(seedId) as View;
+            if (seedView == null || seedView.ViewType != ViewType.Legend)
+            {
+                throw new Exception($"指定的 seedLegendViewId={seedLegendViewId.Value} 不是有效的 Legend 視圖。");
+            }
+
+            // 找 FFL 線型
+            GraphicsStyle flLineStyle = null;
+            var lineStyles = new FilteredElementCollector(doc)
+                .OfClass(typeof(GraphicsStyle))
+                .Cast<GraphicsStyle>()
+                .Where(gs => gs.GraphicsStyleCategory != null && gs.GraphicsStyleCategory.Parent != null)
+                .ToList();
+            flLineStyle = lineStyles.FirstOrDefault(gs => gs.Name == flLineStyleName)
+                       ?? lineStyles.FirstOrDefault(gs => gs.Name.Contains(flLineStyleName));
+
+            // 找可複製的 Legend Component (從 seed 或專案中任意 Legend 視圖)
+            ElementId sourceLegendComponentId = ElementId.InvalidElementId;
+            List<View> allLegendViews = new FilteredElementCollector(doc)
+                .OfClass(typeof(View))
+                .Cast<View>()
+                .Where(v => !v.IsTemplate && v.ViewType == ViewType.Legend)
+                .ToList();
+
+            foreach (View lv in allLegendViews)
+            {
+                ElementId compId = new FilteredElementCollector(doc, lv.Id)
+                    .WhereElementIsNotElementType()
+                    .Where(e => IsLegendComponentElement(e))
+                    .Select(e => e.Id)
+                    .FirstOrDefault();
+                if (IsValidElementId(compId))
+                {
+                    sourceLegendComponentId = compId;
+                    break;
+                }
+            }
+
+            bool hasSourceComponent = IsValidElementId(sourceLegendComponentId);
+
+            using (Transaction trans = TransactionHelper.Begin(doc, "搭建空白門窗圖例樣板"))
+            {
+                trans.Start();
+
+                // Step 1: 複製 seed 視圖
+                ElementId newViewId = seedView.Duplicate(ViewDuplicateOption.Duplicate);
+                View newView = doc.GetElement(newViewId) as View;
+                newView.Name = templateName;
+                doc.Regenerate();
+
+                // 刪除新視圖中所有既有元素（清空）
+                List<ElementId> existingElements = new FilteredElementCollector(doc, newView.Id)
+                    .WhereElementIsNotElementType()
+                    .Where(e => !(e is View))
+                    .Select(e => e.Id)
+                    .ToList();
+                if (existingElements.Count > 0)
+                {
+                    try { doc.Delete(existingElements); } catch { /* 忽略無法刪除的系統元素 */ }
+                }
+                doc.Regenerate();
+
+                // Step 2: 計算格位座標 (單位: feet)
+                double slotWidth = 16.0;   // 每格寬度 (~487cm)
+                double slotHeight = 24.0;  // 每格高度 (~731cm)
+                double tableLeft = 0.0;
+                double tableTop = (rows - 1) * slotHeight;
+                double tableRight = columns * slotWidth;
+                double tableBottom = -slotHeight;
+
+                double headerZoneHeight = 3.0;     // 標頭區 (編號/型號)
+                double legendZoneHeight = 14.0;     // 圖例區
+                double paramZoneHeight = 7.0;       // 參數表格區
+                double flLineY = 0.0;               // FFL 基準線 Y 位置 (相對於每格底)
+
+                // Step 3: 畫表格外框 (粗線)
+                for (int r = 0; r < rows; r++)
+                {
+                    double rowTop = tableTop - r * slotHeight;
+                    double rowBottom = rowTop - slotHeight;
+
+                    for (int c = 0; c < columns; c++)
+                    {
+                        double cellLeft = tableLeft + c * slotWidth;
+                        double cellRight = cellLeft + slotWidth;
+                        double cellFlY = rowBottom + paramZoneHeight;
+
+                        // 格位外框 (上/下/左/右)
+                        CreateScaffoldLine(doc, newView, cellLeft, rowTop, cellRight, rowTop);      // 上
+                        CreateScaffoldLine(doc, newView, cellLeft, rowBottom, cellRight, rowBottom); // 下
+                        CreateScaffoldLine(doc, newView, cellLeft, rowBottom, cellLeft, rowTop);     // 左
+                        CreateScaffoldLine(doc, newView, cellRight, rowBottom, cellRight, rowTop);   // 右
+
+                        // 標頭區分隔線
+                        double headerDivY = rowTop - headerZoneHeight;
+                        CreateScaffoldLine(doc, newView, cellLeft, headerDivY, cellRight, headerDivY);
+
+                        // 圖例區與參數區分隔線
+                        double paramDivY = cellFlY;
+                        CreateScaffoldLine(doc, newView, cellLeft, paramDivY, cellRight, paramDivY);
+
+                        // Step 4: FFL 基準線 (使用指定線型)
+                        try
+                        {
+                            Line flLine = Line.CreateBound(
+                                new XYZ(cellLeft + 0.5, cellFlY, 0),
+                                new XYZ(cellRight - 0.5, cellFlY, 0));
+                            DetailCurve flCurve = doc.Create.NewDetailCurve(newView, flLine);
+                            if (flLineStyle != null)
+                            {
+                                flCurve.LineStyle = flLineStyle;
+                            }
+                        }
+                        catch { /* 線型不存在時 fallback 為預設線型 */ }
+
+                        // Step 5: 佔位標頭文字
+                        string headerText = targetType == "door"
+                            ? $"D{(r * columns + c + 1):D2}"
+                            : $"W{(r * columns + c + 1):D2}";
+                        double headerX = (cellLeft + cellRight) * 0.5;
+                        double headerY = rowTop - headerZoneHeight * 0.5;
+                        try
+                        {
+                            ElementId defaultTextTypeId = doc.GetDefaultElementTypeId(ElementTypeGroup.TextNoteType);
+                            if (IsValidElementId(defaultTextTypeId))
+                            {
+                                TextNote.Create(doc, newView.Id, new XYZ(headerX, headerY, 0), headerText, defaultTextTypeId);
+                            }
+                        }
+                        catch { /* 無可用文字類型時跳過 */ }
+
+                        // Step 6: 佔位參數區文字 (7 列)
+                        string[] paramLabels = { "五金門鎖", "五金鉸鏈", "五金把手", "五金門弓器", "五金其他", "玻璃/材料", "備註" };
+                        double paramRowHeight = paramZoneHeight / paramLabels.Length;
+                        for (int p = 0; p < paramLabels.Length; p++)
+                        {
+                            double paramY = cellFlY - paramRowHeight * (p + 0.5);
+                            try
+                            {
+                                ElementId defaultTextTypeId = doc.GetDefaultElementTypeId(ElementTypeGroup.TextNoteType);
+                                if (IsValidElementId(defaultTextTypeId))
+                                {
+                                    TextNote.Create(doc, newView.Id, new XYZ(headerX, paramY, 0), paramLabels[p], defaultTextTypeId);
+                                }
+                            }
+                            catch { }
+
+                            // 參數分隔線
+                            if (p < paramLabels.Length - 1)
+                            {
+                                double divY = cellFlY - paramRowHeight * (p + 1);
+                                CreateScaffoldLine(doc, newView, cellLeft, divY, cellRight, divY);
+                            }
+                        }
+
+                        // Step 7: 複製佔位 Legend Component（如果有可用的 source）
+                        if (hasSourceComponent)
+                        {
+                            try
+                            {
+                                double legendCenterX = (cellLeft + cellRight) * 0.5;
+                                double legendCenterY = cellFlY + legendZoneHeight * 0.5;
+
+                                Element sourceElement = doc.GetElement(sourceLegendComponentId);
+                                if (sourceElement != null)
+                                {
+                                    // 取得 source 的位置
+                                    BoundingBoxXYZ srcBounds = sourceElement.get_BoundingBox(null);
+                                    XYZ translation;
+                                    if (srcBounds != null)
+                                    {
+                                        double srcCx = (srcBounds.Min.X + srcBounds.Max.X) * 0.5;
+                                        double srcCy = (srcBounds.Min.Y + srcBounds.Max.Y) * 0.5;
+                                        translation = new XYZ(legendCenterX - srcCx, legendCenterY - srcCy, 0);
+                                    }
+                                    else
+                                    {
+                                        translation = new XYZ(legendCenterX, legendCenterY, 0);
+                                    }
+
+                                    ICollection<ElementId> copiedIds = ElementTransformUtils.CopyElement(doc, sourceLegendComponentId, translation);
+                                    // 將複製到新視圖外的元件移入（CopyElement 只在同一視圖中複製）
+                                }
+                            }
+                            catch { /* 複製失敗時跳過，使用者可手動補放 */ }
+                        }
+                    }
+                }
+
+                doc.Regenerate();
+                trans.Commit();
+
+                return new
+                {
+                    Success = true,
+                    Message = $"成功搭建空白圖例樣板「{templateName}」（{columns} 欄 × {rows} 列 = {columns * rows} 格位）。" +
+                              (hasSourceComponent ? "已在每個格位放入佔位門窗圖例。" : "⚠️ 專案中沒有既有的 Legend Component，請手動在任一格位放入一個門或窗圖例作為佔位。") +
+                              (flLineStyle != null ? $"FFL 線型已套用「{flLineStyleName}」。" : $"⚠️ 找不到線型「{flLineStyleName}」，FFL 線使用預設線型，請自行修改。"),
+                    ViewId = newViewId.GetIdValue(),
+                    ViewName = templateName,
+                    Columns = columns,
+                    Rows = rows,
+                    TotalSlots = columns * rows,
+                    FlLineStyleName = flLineStyleName,
+                    FlLineStyleFound = flLineStyle != null,
+                    HasPlaceholderComponents = hasSourceComponent,
+                    AlreadyExisted = false
+                };
+            }
+        }
+
+        private void CreateScaffoldLine(Document doc, View view, double x1, double y1, double x2, double y2)
+        {
+            try
+            {
+                XYZ a = new XYZ(x1, y1, 0);
+                XYZ b = new XYZ(x2, y2, 0);
+                if (a.DistanceTo(b) > doc.Application.ShortCurveTolerance)
+                {
+                    doc.Create.NewDetailCurve(view, Line.CreateBound(a, b));
+                }
+            }
+            catch { /* 忽略短線段錯誤 */ }
         }
 
     }

@@ -55,6 +55,7 @@
 | `matchline-automation.md` | 輔助工作流程 | 銜接線自動標註邏輯，屬從屬視圖出圖流程背景知識，無專屬 Skill |
 | `viewport-type-scale-sync.md` | 輔助工作流程 | 視埠標題類型依比例同步邏輯，屬圖紙管理背景知識，無專屬 Skill |
 | `mep-space-demand-matrix.md` | 前期方法論（Skill 待補） | MEP 前期容量與空間收斂方法。核心載體 Space 目前無 MCP 工具支援（見 `tool-capability-boundary.md` L12），須先實機驗證 `create_view_schedule` 能否建立 Space 明細表，確認自動化程度後才產生對應 Skill |
+| `door-window-legend-template-workflow.md` | 輔助工作流程 | 基於圖例樣板與明細表的門窗圖例自動繪製與儲存格合併 SOP，由 `door-window-legend-tools` 引用 |
 | `README.md` | 目錄導航 | 本檔案，不是工作流程 |
 
 ---
